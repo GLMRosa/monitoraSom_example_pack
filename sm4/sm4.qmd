@@ -1,0 +1,358 @@
+---
+title: "De gravações brutas a um corpus segmentado: uma implantação SM4 multiespécie"
+subtitle: "exemplo monitoraSom — o conjunto `sm4`"
+lang: pt-BR
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+execute:
+  eval: true
+  warning: true
+  error: false
+---
+
+## O que é este conjunto de dados
+
+Uma implantação de Wildlife Acoustics SM4 do início de 2024, anotada
+**exaustivamente para todas as espécies** — sem restrição a um único alvo. É por
+isso que ele serve para mostrar como um corpus se torna analisável: das gravações
+brutas, passando pela segmentação, até um conjunto de templates.
+
+| | |
+|---|---|
+| Gravações | 15 (12 legíveis + 3 vazias de propósito) |
+| ROIs | 133, cobrindo todas as 12 gravações legíveis |
+| Rótulos de espécie | 8 |
+| Templates marcados | **3** — um por espécie dominante |
+| Arquivo auxiliar do gravador | `W50940S22938_A_Summary.txt` (lat/lon, temperatura, bateria) |
+
+| Espécie (`roi_label`) | `roi_type` | ROIs |
+|---|---|---|
+| *Picumnus temminckii* | song | 58 |
+| *Turdus leucomelas* | song / call | 32 / 4 |
+| *Leptotila rufaxilla* | call | 30 |
+| *Patagioenas picazuro* | song | 4 |
+| *Pitangus sulphuratus* | song | 2 |
+| *Lathrotriccus euleri* | song | 1 |
+| *Megarynchus pitangua* | song | 1 |
+| `NOT IDENTIFIED` | song | 1 |
+
+`NOT IDENTIFIED` é uma vocalização real, não resolvida.
+
+::: {.callout-note}
+## Anotação exaustiva muda o que você pode concluir
+
+Como toda vocalização audível foi rotulada, uma detecção que não casa com nenhuma
+ROI realmente é um falso positivo. Em um corpus anotado para uma única espécie
+isso não vale: ali a contagem de falsos positivos é um limite superior, porque a
+detecção pode ter caído sobre algo que ninguém rotulou.
+:::
+
+::: {.callout-important}
+## Três gravações estão vazias de propósito
+
+`W50940S22938_20240222_15{2,3,4}000.wav` têm 0 byte. São **fixtures, não
+defeitos** — não conserte nem apague. Elas existem para você praticar o
+tratamento de erros que vai precisar no seu próprio material.
+:::
+
+## Estrutura do diretório
+
+Este diretório é um **projeto monitoraSom autocontido**. Todo caminho armazenado
+dentro de `rois.duckdb` é relativo a ele, então você pode mover a pasta inteira
+para qualquer lugar e tudo continua funcionando.
+
+A pasta `soundscapes/` mantém o **layout nativo do cartão SM4** — o arquivo de
+sumário um nível acima de um subdiretório `Data/` — para que corresponda ao que
+você obtém do seu próprio gravador. O sumário é de onde vêm latitude, longitude,
+temperatura e leituras de bateria; não o mova.
+
+```
+sm4/
+├── sm4.qmd                          este documento
+├── soundscapes/
+│   ├── W50940S22938_A_Summary.txt   auxiliar do SM4 — um nível ACIMA de Data/
+│   └── Data/
+│       └── W50940S22938_…wav        15 gravações (três delas com 0 byte)
+└── rois.duckdb                      133 ROIs segmentadas à mão, 3 marcadas
+```
+
+**O que deliberadamente *não* está aqui**: a tabela de metadados dos soundscapes,
+quaisquer cortes de template, e todos os resultados posteriores. Tudo isso é
+regenerado pelos comandos abaixo. O pacote de exemplos distribui apenas o que não
+pode ser recalculado: o áudio e a segmentação manual.
+
+## Preparação
+
+```{r setup}
+library(monitoraSom)
+library(dplyr)
+
+# Se você abrir este documento a partir de outra pasta, aponte o R para cá.
+# Nunca use caminho absoluto: isso amarra o projeto a uma máquina.
+if (!file.exists("rois.duckdb")) setwd(file.path("example_pack", "sm4"))
+
+basename(getwd())   # "sm4"
+```
+
+## Lendo as entradas
+
+Aponte a leitura para `soundscapes/`, **não** para `soundscapes/Data/`: a função
+entra nos subdiretórios sozinha e precisa enxergar o arquivo de sumário, que fica
+acima deles e é de onde vêm as coordenadas.
+
+```{r inputs}
+df_soundscapes <- fetch_soundscape_metadata(
+  soundscapes_path = "./soundscapes/",
+  output_file      = "soundscapes_metadata.duckdb"
+)
+
+df_rois <- fetch_rois(rois_path = "rois.duckdb")
+
+nrow(df_soundscapes)   # 12 — as três vazias não entraram
+
+# Coordenadas e condições vêm do sumário, não dos cabeçalhos WAV.
+df_soundscapes |> select(soundscape_file, soundscape_lat, soundscape_lon)
+
+sort(table(df_rois$roi_label), decreasing = TRUE)
+```
+
+## Verificando as gravações antes de analisar
+
+Um corpus vindo de um cartão real nunca é limpo. São duas checagens, porque há
+dois tipos de falha e uma não pega a outra.
+
+```{r checks}
+# 1. Alguma gravação não abriu? Compare os arquivos em disco com as linhas lidas.
+n_arquivos <- length(list.files("soundscapes", pattern = "\\.wav$",
+                                ignore.case = TRUE, recursive = TRUE))
+n_arquivos - nrow(df_soundscapes)   # 3 não abriram
+
+# 2. Alguma abriu mas está vazia?
+sum(df_soundscapes$soundscape_duration == 0)   # 0 aqui
+```
+
+As três que não abriram são os arquivos de 0 byte. Elas não somem em silêncio: a
+leitura emite um aviso e registra o motivo de cada uma. Se quiser ver os motivos,
+eles ficam no próprio arquivo de metadados:
+
+```{r errors}
+con <- DBI::dbConnect(duckdb::duckdb(), "soundscapes_metadata.duckdb",
+                      read_only = TRUE)
+df_errors <- DBI::dbReadTable(con, "metadata_errors")
+DBI::dbDisconnect(con, shutdown = TRUE)
+
+df_errors[, c("soundscape_path", "error_message")]
+```
+
+A mensagem `non-conformable arguments` vem do leitor de áudio encontrando um
+arquivo sem cabeçalho. Ela é repassada como veio, sem reescrita, para que você
+consiga distinguir uma falha conhecida de uma nova.
+
+```{r guard}
+df_usable <- df_soundscapes |> filter(soundscape_duration > 0)
+
+nrow(df_usable)   # 12 utilizáveis
+```
+
+O filtro importa mais do que parece nesta vinheta: mais adiante você vai exportar
+um arquivo de anotação por gravação, e uma gravação malformada geraria um arquivo
+vazio — indistinguível de uma que você revisou e não encontrou nada.
+
+## Abrindo o app de segmentação
+
+Foi assim que as 133 ROIs foram feitas, e é assim que você as estenderia.
+
+```{r seg-app, eval = FALSE}
+# eval = FALSE de propósito: o app é interativo e este exemplo ainda está
+# incompleto — o trecho é só documentação de uso.
+launch_segmentation_app(
+  project_path     = ".",
+  soundscapes_path = "soundscapes",
+  roi_user         = "your-name",
+  wl = 1024, ovlp = 50, dyn_range = c(-96, -36),
+  time_guide_interval = 3, freq_guide_interval = 2
+)
+```
+
+## Marcando templates
+
+Uma ROI vira template quando você escreve `template` no campo de **comentário**
+dela. Escolher quais vocalizações viram templates é decisão biológica, feita à
+mão: procure exemplos limpos e bem isolados. Três já estão marcadas, uma por
+espécie dominante:
+
+| Espécie | `roi_type` | Trecho na gravação de origem |
+|---|---|---|
+| *Picumnus temminckii* | song | 28,783 - 32,924 s |
+| *Turdus leucomelas* | song | 14,417 - 16,628 s |
+| *Leptotila rufaxilla* | call | 44,422 - 46,048 s |
+
+```{r templates}
+df_template_rois <- df_rois |>
+  filter(grepl("template", roi_comment, ignore.case = TRUE))
+
+nrow(df_template_rois)   # 3
+
+manifest <- export_templates(
+  df_template_rois,
+  templates_path = "templates",
+  create_dir    = TRUE
+)
+```
+
+::: {.callout-warning}
+## Marque primeiro, corte depois
+
+`export_templates()` grava arquivos WAV, mas **não** escreve de volta em
+`rois.duckdb`. Se você selecionar ROIs à mão e cortá-las sem antes escrever
+`template` no comentário, os cortes aparecem em disco enquanto a base continua
+dizendo que há zero templates — e apagar `templates/` perde a seleção sem forma de
+recuperá-la.
+:::
+
+## Trocando anotações com Raven e Audacity
+
+A maioria das pessoas não começa no monitoraSom: chega com seleções feitas no
+Raven Pro ou rótulos feitos no Audacity. Quatro funções cobrem as duas direções.
+
+| | Ler para dentro | Escrever para fora |
+|---|---|---|
+| Raven Pro | `read_raven_selection()` | `write_raven_selection()` |
+| Audacity | `read_audacity_labels()` | `write_audacity_labels()` |
+
+### Exportando: um arquivo por gravação
+
+Nenhum dos dois formatos guarda o nome da gravação por dentro — cada arquivo
+descreve **uma** gravação, com tempos contados a partir do início dela. Então uma
+tabela com várias gravações precisa ser dividida antes de exportar, senão os
+tempos ficam sem sentido.
+
+```{r annotations-export}
+dir.create("annotations/audacity", recursive = TRUE, showWarnings = FALSE)
+dir.create("annotations/raven",    recursive = TRUE, showWarnings = FALSE)
+
+for (rec in unique(df_rois$soundscape_file)) {
+  sub  <- df_rois |> filter(soundscape_file == rec)
+  stem <- tools::file_path_sans_ext(rec)
+
+  write_audacity_labels(sub, file.path("annotations/audacity", paste0(stem, ".txt")))
+  write_raven_selection(sub, file.path("annotations/raven",
+                                       paste0(stem, ".Table.1.selections.txt")))
+}
+
+length(list.files("annotations/audacity"))   # um por gravação, depende do corpus
+```
+
+Abra `annotations/audacity/` no Audacity ou `annotations/raven/` no Raven Pro
+para ver as anotações carregarem sobre a gravação correspondente.
+
+```{r audacity-peek}
+# Audacity: início<TAB>fim<TAB>rótulo, com uma linha extra para a faixa de
+# frequência quando a ROI tem uma.
+readLines("annotations/audacity/W50940S22938_20240116_135000.txt", n = 4)
+```
+
+```{r raven-peek}
+# Raven: arquivo separado por tabulações, com cabeçalho e uma seleção por linha.
+readLines("annotations/raven/W50940S22938_20240116_135000.Table.1.selections.txt", n = 3)
+```
+
+As frequências são guardadas em **kHz** no monitoraSom e escritas em **Hz** nos
+dois formatos, que é o que esses programas esperam. Na leitura, a conversão é
+desfeita automaticamente.
+
+### Importando de volta
+
+```{r annotations-import}
+back_audacity <- read_audacity_labels(
+  "annotations/audacity/W50940S22938_20240116_135000.txt"
+)
+back_raven <- read_raven_selection(
+  "annotations/raven/W50940S22938_20240116_135000.Table.1.selections.txt"
+)
+
+nrow(back_audacity)
+nrow(back_raven)
+```
+
+Vale conferir que nada se perde na ida e volta:
+
+```{r roundtrip}
+compare_cols <- c("roi_start", "roi_end", "roi_min_freq", "roi_max_freq", "roi_label")
+
+original <- df_rois |>
+  filter(soundscape_file == "W50940S22938_20240116_135000.wav") |>
+  arrange(roi_start, roi_end) |>
+  select(all_of(compare_cols)) |>
+  as.data.frame()
+
+tidy_up <- function(x) {
+  x |> arrange(roi_start, roi_end) |> select(all_of(compare_cols)) |> as.data.frame()
+}
+
+isTRUE(all.equal(original, tidy_up(back_audacity), tolerance = 1e-6))
+isTRUE(all.equal(original, tidy_up(back_raven),    tolerance = 1e-6))
+```
+
+::: {.callout-warning}
+## A ida e volta não carrega tudo
+
+Só sobrevivem as cinco colunas comparadas acima. Os formatos não têm onde guardar
+`roi_comment`, `roi_type`, `roi_user`, `roi_channel` nem os indicadores de
+confiança — ou seja, **a marcação de template se perde**. Exporte para anotar,
+importe para trazer a geometria de volta, mas mantenha o `rois.duckdb` como o
+registro de todo o resto.
+:::
+
+### Trazendo anotações feitas fora
+
+Este é o caso mais comum. Como o arquivo não diz a que gravação pertence, informe
+isso com `soundscape_path`:
+
+```{r annotations-inbound}
+imported <- read_raven_selection(
+  "annotations/raven/W50940S22938_20240116_135000.Table.1.selections.txt",
+  soundscape_path = "soundscapes/Data/W50940S22938_20240116_135000.wav"
+)
+
+imported |> select(soundscape_file, roi_start, roi_end, roi_label) |> head(3)
+```
+
+Daqui em diante é uma tabela de ROIs comum: pode ser gravada em uma base, passada
+a `export_templates()`, ou combinada com a segmentação que você já tem.
+
+## O que foi criado
+
+Depois de rodar tudo acima, a pasta contém:
+
+```
+sm4/
+├── sm4.qmd                        este documento (já existia)
+├── sm4.html                       o documento renderizado
+├── rois.duckdb                    as 133 ROIs (já existia)
+├── soundscapes/                   as 15 gravações + sumário (já existia)
+├── soundscapes_metadata.duckdb    ← criado ao ler os metadados
+├── templates/                     ← criado ao recortar os templates
+│   ├── templates.duckdb           o manifesto: 1 linha por template
+│   └── W50940S22938_…wav          os 3 cortes de áudio
+└── annotations/                   ← criado ao exportar as anotações
+    ├── audacity/                  12 arquivos .txt, um por gravação
+    └── raven/                     12 tabelas de seleção, uma por gravação
+```
+
+| Arquivo | Quem cria | Para que serve |
+|---|---|---|
+| `soundscapes_metadata.duckdb` | `fetch_soundscape_metadata()` | duração, taxa de amostragem, coordenadas e caminho de cada gravação; guarda também a tabela `metadata_errors`, com o motivo de cada falha de leitura |
+| `templates/*.wav` | `export_templates()` | os templates recortados, que a busca usa como referência |
+| `templates/templates.duckdb` | `export_templates()` | o manifesto que descreve os cortes; `fetch_template_metadata()` o lê, diretamente ou via a pasta `templates/` |
+| `annotations/audacity/*.txt` | `write_audacity_labels()` | rótulos para abrir no Audacity |
+| `annotations/raven/*.selections.txt` | `write_raven_selection()` | tabelas de seleção para abrir no Raven Pro |
+
+Nada disso precisa ser guardado: apagando qualquer um deles, os comandos acima
+recriam tudo de forma idêntica — inclusive os cortes, byte a byte, porque a
+identidade de um template vem do conteúdo da gravação de origem e não do caminho
+dela. Os únicos arquivos insubstituíveis são o áudio e `rois.duckdb`, que contém
+a segmentação manual.

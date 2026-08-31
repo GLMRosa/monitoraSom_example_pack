@@ -1,0 +1,384 @@
+---
+title: "Validando detecções contra a verdade de referência: *Myiothlypis flaveola*"
+subtitle: "exemplo monitoraSom — o conjunto `audiomoth`"
+lang: pt-BR
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+execute:
+  eval: true
+  warning: true
+  error: false
+---
+
+## O que é este conjunto de dados
+
+Uma implantação de AudioMoth de dezembro de 2023, segmentada para *Myiothlypis
+flaveola* (pula-pula-amarelo). Os templates e o espaço de busca são as **mesmas
+gravações**, então cada ROI serve ao mesmo tempo como possível origem de template
+e como verdade de referência — é isso que permite validar as detecções
+automaticamente.
+
+| | |
+|---|---|
+| Gravações | 16 (15 legíveis + 1 truncada de propósito) |
+| ROIs | 115 — 93 `song`, 22 `call` |
+| Templates marcados | 4 |
+| Escopo da anotação | **apenas *M. flaveola***, com as 15 gravações legíveis revisadas |
+| Arquivo auxiliar do gravador | `CONFIG.TXT` (ganho, filtro, agendamento) |
+
+::: {.callout-important}
+## Só cantos de *M. flaveola* estão segmentados
+
+Use este conjunto para medir recall e falsos negativos da espécie-alvo. **Não** o
+use para calcular taxa de falsos positivos: um template que apresentar uma detecção em potencial sobre sobre outra ave cai em região não anotada, onde não há resposta certa registrada. E ausência
+de ROI não significa silêncio — significa apenas que ninguém rotulou ali.
+:::
+
+::: {.callout-note}
+## Uma gravação está quebrada de propósito
+
+`W04870903S2027082_20231215_073004.WAV` tem 44 bytes: cabeçalho WAV sem áudio. É
+uma **fixture, não um defeito** — não conserte nem apague. Ela existe para você
+praticar o tratamento de erros que vai precisar no seu próprio material.
+:::
+
+## Estrutura do diretório
+
+Este diretório é um **projeto monitoraSom autocontido**. Todo caminho armazenado
+dentro de `rois.duckdb` é relativo a ele, então você pode mover a pasta inteira
+para qualquer lugar e tudo continua funcionando.
+
+```
+audiomoth/
+├── audiomoth.qmd        este documento
+├── soundscapes/
+│   ├── CONFIG.TXT       arquivo de configuração do AudioMoth
+│   └── W04870903S2027082_…WAV   16 gravações (uma delas com 44 bytes)
+└── rois.duckdb          115 ROIs segmentadas à mão, 4 marcadas como templates
+```
+
+**O que deliberadamente *não* está aqui**: a tabela de metadados dos soundscapes,
+os cortes de template e seu manifesto, e todos os resultados posteriores. Tudo
+isso é regenerado pelos comandos abaixo. O pacote de exemplos distribui apenas o
+que não pode ser recalculado: o áudio e a segmentação manual.
+
+## Preparação
+
+```{r setup}
+library(monitoraSom)
+library(dplyr)
+
+# Se você abrir este documento a partir de outra pasta, aponte o R para cá.
+# Nunca use caminho absoluto: isso amarra o projeto a uma máquina.
+if (!file.exists("rois.duckdb")) setwd(file.path("example_pack", "audiomoth"))
+
+basename(getwd())   # "audiomoth"
+```
+
+## Lendo as entradas
+
+```{r inputs}
+df_soundscapes <- fetch_soundscape_metadata(
+  soundscapes_path = "soundscapes",
+  output_file      = "soundscapes_metadata.duckdb"
+)
+
+df_rois <- fetch_rois(rois_path = "rois.duckdb")
+
+nrow(df_soundscapes)      # 16 gravações lidas
+table(df_rois$roi_type)   # 93 song, 22 call
+```
+
+## Verificando as gravações antes de analisar
+
+Antes de qualquer análise, confirme que todas as gravações foram lidas e que
+nenhuma está vazia. São duas verificações porque há dois tipos de falha, e uma
+não pega a outra.
+
+```{r checks}
+# 1. Alguma gravação não abriu? Compare os arquivos em disco com as linhas lidas.
+n_arquivos <- length(list.files("soundscapes", pattern = "\\.wav$",
+                                ignore.case = TRUE))
+n_arquivos - nrow(df_soundscapes)   # 0 = todas abriram
+
+# 2. Alguma abriu mas está vazia? Só a duração revela.
+df_soundscapes |>
+  filter(soundscape_duration == 0) |>
+  select(soundscape_file, soundscape_duration, soundscape_sample_rate)
+```
+
+A primeira verificação volta `0`: nenhuma gravação falhou ao abrir. A segunda
+encontra uma linha — o arquivo de 44 bytes. Ele tem cabeçalho válido, então é
+lido como uma gravação normal, com taxa de amostragem plausível de 48 kHz e zero
+segundos de áudio. Nenhum erro é emitido.
+
+**Filtre antes de continuar.** Tudo daqui para frente usa `df_usable`.
+
+```{r guard}
+df_usable <- df_soundscapes |> filter(soundscape_duration > 0)
+
+nrow(df_usable)   # 15 utilizáveis
+```
+
+::: {.callout-warning}
+## Por que não basta confiar no pipeline
+
+A gravação vazia seria descartada de qualquer forma mais adiante, com um aviso do
+tipo *"4 crossing(s) whose template is at least as long as the soundscape"*. Mas
+esse aviso descreve uma condição geométrica: ele não diz qual arquivo é, nem que
+ele está quebrado. Filtrando antes, você sabe exatamente o que saiu e por quê.
+:::
+
+## Abrindo o app de segmentação
+
+Foi assim que as 115 ROIs foram feitas, e é assim que você as estenderia.
+
+```{r seg-app, eval = FALSE}
+# eval = FALSE de propósito: o app é interativo e este exemplo ainda está
+# incompleto — o trecho é só documentação de uso.
+launch_segmentation_app(
+    project_path = ".",
+    roi_user = "your-name",
+    df_soundscapes = df_usable,
+    wl = 1024, ovlp = 50, dyn_range = c(-96, -36),
+    time_guide_interval = 3, freq_guide_interval = 2
+)
+```
+
+Passando `df_soundscapes = df_usable`, o app revisa exatamente as linhas dessa
+tabela, na ordem em que estão, e não varre a pasta — então a gravação quebrada
+nunca aparece na sua fila. A alternativa é `soundscapes_path = "soundscapes"`,
+que varre o diretório e entrega as dezesseis.
+
+Filtre a tabela com `dplyr` antes de abrir o app e você controla a fila de
+revisão: um subconjunto de espécies, um intervalo de datas, ou só as gravações
+legíveis.
+
+Uma ROI vira template quando você escreve `template` no campo de **comentário**
+dela, dentro do app.
+
+## Reconstituindo os templates
+
+Os 4 templates não são distribuídos como arquivos: são recortados na hora, a
+partir da tabela de ROIs e do áudio. O resultado é idêntico byte a byte toda vez,
+porque a identidade de um template vem do conteúdo da gravação de origem, não do
+caminho dela.
+
+```{r templates}
+df_template_rois <- df_rois |>
+  filter(grepl("template", roi_comment, ignore.case = TRUE))
+
+manifest <- export_templates(
+  df_template_rois,
+  templates_path = "./templates/",
+  create_dir    = TRUE
+)
+
+df_templates <- fetch_template_metadata(
+  templates_path = file.path("templates", "templates.duckdb")
+)
+nrow(df_templates)   # 4
+```
+
+::: {.callout-note}
+## A pasta de cortes também é aceita
+
+`fetch_template_metadata()` lê tanto o manifesto `templates/templates.duckdb`
+quanto a pasta `templates/`: passando a pasta, o manifesto dentro dela é
+encontrado e lido. (Uma pasta **sem** manifesto é interpretada como templates de
+nome legado.) O manifesto é sempre gravado com esse nome, ao lado dos cortes.
+:::
+
+## Rodando a detecção
+
+A busca inteira é uma chamada só. `template_matching()` cuida dos metadados, da
+grade de busca, da pontuação e da detecção de picos, e devolve as detecções.
+
+```{r matching}
+df_detecs <- template_matching(
+  soundscapes_path = "soundscapes/",
+  templates_path   = "templates/templates.duckdb",
+  score_method     = "fft",
+  min_score        = 0.4
+)
+
+nrow(df_detecs)   # depende do limiar e do corpus atual
+```
+
+O aviso sobre 4 dos 64 cruzamentos descartados são os quatro templates pareados
+contra a gravação vazia — o orquestrador lê a pasta inteira, então ela entra e é
+eliminada aqui dentro. Como você já a identificou na verificação, o aviso é
+confirmação, não surpresa.
+
+## Validando contra a verdade de referência
+
+Como as ROIs cobrem as mesmas gravações que os templates percorreram, cada
+detecção pode ser julgada automaticamente.
+
+```{r validate}
+val <- validate_by_overlap(df_detecs, df_rois, validation_user = "vignette")
+
+df_validated <- val$detections_validated
+table(df_validated$validation)   # quantos TP e FP
+nrow(val$false_negatives)        # ROIs de referência não alcançadas
+```
+
+Todas as detecções caíram sobre vocalizações anotadas, então a precisão é
+1,0 — os números exatos aparecem na saída do bloco acima. O ponto fraco é o
+recall: a maioria das ROIs de referência não foi alcançada neste limiar.
+
+::: {.callout-important}
+## Zero falsos positivos não significa nenhum erro
+
+Como só *M. flaveola* foi anotada, uma detecção sobre outra espécie cai em região
+sem resposta registrada e não é contada como erro. Leia o resultado como *"nenhum
+falso positivo entre as vocalizações que rotulamos"*. Para um número real, seria
+preciso um conjunto anotado exaustivamente, todas as espécies incluídas.
+:::
+
+## Diagnósticos
+
+```{r diagnostics}
+diags <- diagnostic_validations(df_validated, build_plots = TRUE)
+
+# O nome de cada template traz gravador, data/hora, espécie, tipo e um hash.
+# Aqui mostramos só a data/hora, que é o que distingue os quatro.
+data.frame(
+  cut_from     = sub("^([^_]+)_([0-9]{8}_[0-9]{6}).*", "\\2", names(diags)),
+  score_cut    = round(sapply(diags, `[[`, "score_cut"), 3),
+  max_observed = round(sapply(diags, function(d) max(d$diagnostics$peak_score)), 3),
+  row.names    = NULL
+)
+```
+
+Os quatro templates pedem o mesmo limiar: **0,01**, o menor valor possível.
+
+::: {.callout-warning}
+## Um resultado sem erros quebra o cálculo do limiar
+
+O limiar é escolhido maximizando o F1. Sem nenhum falso positivo, a precisão é
+1,0 em qualquer limiar, então baixar o corte só aumenta o recall e nada penaliza
+— o ótimo cai no menor valor da lista. O número está certo e é inútil na prática:
+usar 0,01 em gravações novas, com outras espécies presentes, encheria a saída de
+detecções erradas.
+
+**Para obter um limiar utilizável**, faça a detecção com `min_score` mais baixo,
+de modo que sons não-alvo entrem no conjunto e possam ser marcados como erro, ou
+valide manualmente em gravações onde outras espécies estejam anotadas.
+:::
+
+```{r diagnostic-plot, fig.alt = "Precisão e recall contra o limiar de score para um template do AudioMoth; a precisão é constante em 1,0 enquanto o recall diminui."}
+diags[[1]]$precrec_plot
+```
+
+No gráfico, a precisão é uma linha reta em 1,0 e só o recall se move — uma curva
+sem troca entre os dois, que é como um caso degenerado se parece.
+
+## Validação manual
+
+O app de validação toca cada detecção, mostra o espectrograma e registra seu
+veredito em `validations.duckdb`. Use-o quando não houver verdade de referência,
+ou para auditar a validação automática.
+
+```{r validation-app, eval = FALSE}
+# eval = FALSE de propósito: o app é interativo e este exemplo ainda está
+# incompleto — o trecho é só documentação de uso.
+launch_validation_app(project_path = ".", validation_user = "your-name")
+```
+
+O app lê e escreve no **mesmo** arquivo: as detecções entram por
+`input_path` e os vereditos são gravados de volta ali, nas colunas `val_*`
+da tabela `signals`. Por isso o exemplo persiste as detecções em
+`detections/detections.duckdb` (a localização padrão) antes de abrir o app:
+
+```{r persist-dets}
+db_detections <- file.path("detections", "detections.duckdb")
+
+if (!file.exists(db_detections)) {
+  dir.create("detections", showWarnings = FALSE)   # output_db exige a pasta
+  template_matching(
+    soundscapes_path = "soundscapes/",
+    templates_path   = "templates/templates.duckdb",
+    score_method     = "fft",
+    min_score        = 0.4,
+    output_db        = db_detections
+  )
+} else {
+  message("Detecções já persistidas em ", db_detections)
+}
+```
+
+Como o app depende de você, as etapas seguintes precisam funcionar tanto antes
+quanto depois de usá-lo. O padrão é escrever uma função que responde "já existem
+validações?" e condicionar o resto a ela.
+
+```{r manual-guard}
+has_manual_validations <- function(path = db_detections) {
+  if (!file.exists(path)) return(FALSE)
+  con <- DBI::dbConnect(duckdb::duckdb(), path, read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con, shutdown = TRUE), add = TRUE)
+  if (!"signals" %in% DBI::dbListTables(con)) return(FALSE)
+  DBI::dbGetQuery(
+    con, "SELECT count(*) AS n FROM signals WHERE val_verdict IS NOT NULL"
+  )$n > 0
+}
+
+has_manual_validations()
+```
+
+```{r manual-diagnostics}
+if (has_manual_validations()) {
+  con <- DBI::dbConnect(duckdb::duckdb(), db_detections, read_only = TRUE)
+  df_manual <- DBI::dbGetQuery(con, "SELECT * FROM signals WHERE val_verdict IS NOT NULL")
+  DBI::dbDisconnect(con, shutdown = TRUE)
+
+  cat("Vereditos manuais:", nrow(df_manual), "\n")
+  print(table(df_manual$val_verdict))
+
+  # Onde a validação automática e a manual discordam:
+  df_validated |>
+    select(detection_id, auto = validation) |>
+    inner_join(df_manual |> select(detection_id, manual = val_verdict),
+               by = "detection_id") |>
+    with(table(auto, manual))
+} else {
+  cat("Ainda não há validações manuais.\n",
+      "Rode launch_validation_app() acima, revise algumas detecções e\n",
+      "renderize este documento de novo.\n")
+}
+```
+
+Rodando este documento antes de usar o app, o bloco explica o que falta; rodando
+depois, ele compara os dois julgamentos. Nada precisa ser editado no meio.
+
+## O que foi criado
+
+Depois de rodar tudo acima, a pasta contém:
+
+```
+audiomoth/
+├── audiomoth.qmd                  este documento (já existia)
+├── audiomoth.html                 o documento renderizado
+├── rois.duckdb                    as 115 ROIs (já existia)
+├── soundscapes/                   as 16 gravações (já existia)
+├── soundscapes_metadata.duckdb    ← criado ao ler os metadados
+├── templates/                     ← criado ao recortar os templates
+│   ├── templates.duckdb           o manifesto: 1 linha por template
+│   └── W04870903S2027082_…wav     os 4 cortes de áudio
+└── detections/
+    └── detections.duckdb          ← criado ao persistir as detecções
+```
+
+| Arquivo | Quem cria | Para que serve |
+|---|---|---|
+| `soundscapes_metadata.duckdb` | `fetch_soundscape_metadata()` | duração, taxa de amostragem, data/hora e caminho de cada gravação; relê rápido em vez de varrer o áudio de novo |
+| `templates/*.wav` | `export_templates()` | os templates recortados, que a busca usa como referência |
+| `templates/templates.duckdb` | `export_templates()` | o manifesto que descreve os cortes; `fetch_template_metadata()` o lê, diretamente ou via a pasta `templates/` |
+| `detections/detections.duckdb` | `template_matching(output_db =)` | as detecções persistidas; o app de validação lê e grava os vereditos aqui, nas colunas `val_*` da tabela `signals` |
+
+Nada disso precisa ser guardado: apagando qualquer um deles, os comandos acima
+recriam tudo de forma idêntica. Os únicos arquivos insubstituíveis são o áudio e
+`rois.duckdb`, que contém a segmentação manual.

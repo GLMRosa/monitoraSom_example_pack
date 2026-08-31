@@ -1,0 +1,46 @@
+# =============================================================================
+# Non-example files — keep out of version control.
+# The example data (recordings, sidecars, rois.duckdb, walkthroughs) and the
+# repo docs (MANIFEST.csv, README.md, STATUS.md, AGENTS.md) stay tracked.
+# Everything a package function can rebuild, plus tooling and session cruft,
+# is ignored. See harness/clean_examples.sh for the byproduct names.
+# =============================================================================
+
+# Maintenance tooling (not distributed with the examples)
+harness/
+.claude/
+.pi/
+
+# R session temp dir (needs a writable TMPDIR; gitignored)
+.tmp_R/
+
+# Regenerable byproducts (see clean_examples.sh BYPRODUCTS)
+templates/
+roi_cuts/
+app_presets/
+soundscapes_metadata.duckdb
+annotations/
+detections/
+
+# Quarto / knitr render output
+**/_freeze/
+**/_output/
+**/.quarto/
+**/*_files/
+*.html
+
+# Bundles produced by ep_tar()
+/*.tar.gz
+
+# R session cruft
+.Rhistory
+.RData
+.Rproj.user/
+
+# OS / editor cruft
+.DS_Store
+*~
+*.swp
+
+AGENTS.md
+STATUS.md

@@ -1,0 +1,385 @@
+---
+title: "Template matching de ponta a ponta: *Basileuterus culicivorus*"
+subtitle: "exemplo monitoraSom — o conjunto `bcu`"
+lang: pt-BR
+knitr:
+  opts_chunk:
+    eval: true
+    warning: true
+    error: false
+output:
+  html_document:
+    toc: true
+    self_contained: true
+---
+
+
+Neste documento, nós, a equipe de desenvolvimento do monitoraSom, percorremos
+com você um fluxo completo de detecção de espécie por template matching.
+Extrairemos templates de gravações focais, aplicaremos a busca em gravações de
+paisagem acústicas e inspecionamos as detecções resultantes. Cada passo é
+executado de verdade neste documento, pois partiremos dos dados brutos que
+preparamos para que você possa reproduzir tudo na sua máquina e adaptar o
+roteiro aos seus próprios dados.
+
+## O que é este conjunto de dados
+
+Este exemplo usará os dados originais usados na publicação da versão 1.0.0 do
+monitoraSom, composto por gravações de *Basileuterus culicivorus* (pula-pula)
+feitas em 2019-2020. É o conjunto sobre o qual os exemplos do pacote foram
+construídos, e será usado aqui para mostrar um fluxo de análise básico para a
+detecção do canto dessa espécie usando template matching. Nesse exemplo
+incluímos gravações focais, feitas diretamente por observadores em campo usando
+gravadores manuais, das quais serão extraídos os templates. Em contrapartida as
+buscas são feitas em um conjunto de gravações de paisagens acústicas gravadas
+por meio de monitoramento acústico passivo, usando gravadores autônomos.
+
+|                      |                                                 |
+| -------------------- | ----------------------------------------------- |
+| Gravações focais     | 2 (`Bcu_1`, `Bcu_2`) de onde vêm os templates   |
+| Soundscapes de busca | 12 onde queremos achar os cantos similares      |
+| ROIs                 | 72 (18 focais + 54 de busca)                    |
+| Templates marcados   | 6 opções disponíveis                            |
+| Espécie              | ***B. culicivorus***                            |
+
+::: {.callout-important}
+## Só cantos de *B. culicivorus* foram segmentados
+
+A quantificação de precisão e recall só funciona para o canto da espécie alvo,
+ou seja, os chamados dessa mesma espécie e vocalizações das demais espécies
+presentes não estão representados nesse exemplo. Duas gravações trazem a marca
+`no signals of interest`, que significa *gravação revisada, nenhum canto da
+espécie de interesse foi encontrado*.
+:::
+
+## Estrutura do diretório
+
+Este conjunto de dados foi construído para ser autosuficiente e permitir o teste de um dos fluxos completos de análise do monitoraSom para detecção de
+uma espécie alvo. O arquivo `rois.duckdb` contém dados de segmentação que
+nós, a equipe de desenvolvimento do `monitoraSom` preparamos para essa
+demonstração. Em um projeto recém iniciado, dados de segmentação estarão
+ausentes.
+
+Os caminhos para arquivos nesses dados de segmentação são relativos ao diretório
+que os contém, logo, permite que a pasta inteira possa ser movida para qualquer
+lugar e tudo continua funcionando quando seguir com as análises. Isso é
+especialmente importante quando se pretende colaborar com outros usuários.
+
+```
+bcu/                     diretório raiz do projeto
+├── bcu.qmd              este documento
+├── recordings/          diretório de gravações focais
+│   ├── Bcu_1.wav        2 gravações focais de onde extrairemos os templates
+│   └── Bcu_2.wav
+├── soundscapes/         diretório onde estão as gravações de paisagens acústicas
+│   └── W54393S25597_…wav    12 gravações de paisagens acústicas (soundscapes)
+└── rois.duckdb          72 regiões de interesse segmentadas manualmente
+```
+
+Fornecemos inicialmente somente aqueles dados essenciais para o ponto de
+partida. Todos os demais tipos de dados serão gerados durante o fluxo de análise
+a seguir.
+
+## Preparação
+
+O nosso primeiro passo é preparar o ambiente para as análises de forma que a
+sessão ativa do R saiba onde estão os arquivos que serão lidos e para onde vão
+os arquivos que vão ser exportados. Idealmente, esse arquivo de exemplo,
+"bcu.qmd", deverá estar presente na raiz do diretório do projeto para que os
+caminhos sejam corretamente identificados ao longo das análises.
+
+```{r setup}
+# Vamos primeiro importar os pacotes que contêm as funções de que vamos precisar
+library(monitoraSom)
+library(dplyr)
+
+# O comando abaixo verifica se a sessão do R já está usando o diretório correto
+# ao procurar pelo arquivo com os dados de segmentação e, caso não encontre,
+# define o diretório do exemplo como diretório de trabalho
+if (!file.exists("rois.duckdb")) setwd(file.path("example_pack", "bcu"))
+
+# Se o caminho tiver sido definido corretamente, antes de rodar o restante da
+# análise, o comando abaixo irá retornar o seguinte output:
+# > [1] "bcu.html"    "bcu.qmd"     "recordings"  "rois.duckdb" "soundscapes"
+list.files(getwd())
+```
+
+## Lendo as entradas
+
+Com o ambiente preparado, vamos ler as entradas do fluxo de análise: os
+metadados das 12 soundscapes e a tabela de ROIs já pronta disponibilizada nesse
+exemplo. A função `fetch_soundscape_metadata()` percorre a pasta de soundscapes,
+lê cada arquivo e guarda informações sobre cada um deles em um banco DuckDB e
+também traz esses dados para dentro da nossa sessão do R.
+
+Esse passo é importante porque os metadados alimentam todas as etapas seguintes,
+e um problema de leitura que passe despercebido aqui se propaga para o resto da
+análise. Se uma gravação corrompida for ignorada em silêncio, o matching vai
+percorrer um espaço de busca menor do que o previsto, e você só perceberia a
+perda pelas detecções que nunca apareceram. Por isso, a função identifica uma
+gravação que não abre, cabeçalhos de metadados cortados, arquivos de zero bytes,
+que são registrados em um log de erros, sem interromper a varredura das demais.
+Pastas vazias, sem nenhuma gravação legível, gera, um erro imediato, e não uma
+tabela vazia que só denunciaria o problema lá na frente.
+
+A função `fetch_rois()` traz as 72 ROIs registradas em `rois.duckdb` também para
+dentro do ambiente da nossa sessão do R.
+
+```{r inputs}
+df_soundscapes <- fetch_soundscape_metadata(
+  soundscapes_path = "soundscapes",
+  output_file = "soundscapes_metadata.duckdb"
+)
+glimpse(df_soundscapes)
+```
+
+Também aqui nós cuidamos para que problemas de leitura não ocorram sem que
+usuário perceba. Quando o caminho aponta para uma pasta com vários bancos de
+ROIs, um arquivo ilegível não é ignorado, de forma que nenhuma segmentação se
+perca sem alarde. Nessa etapa também são feitos controles de tipos e
+compatibilidades de variáveis, de forma que não sejam importados valores
+incompatíveis com o padrão dos dados do monitoraSom. Esses valores são
+convertidos para `NA` e acompanhados de um aviso que aponta o arquivo de origem.
+As checagens também garantem que tabelas produzidas por versões anteriores do
+pacote sejam lidas no formato atual, e que os caminhos das gravações sejam
+padronizados, para que nenhuma ROI fique órfã por diferenças cosméticas na
+escrita de um caminho.
+
+```{r inputs-rois}
+df_rois <- fetch_rois(rois_path = "rois.duckdb")
+glimpse(df_rois)
+```
+
+## Verificando as gravações antes de analisar
+
+Este conjunto foi revisado por nós e não contém problemas, mas é importante
+reconhecer como são dados saudáveis para diagnosticar problemas rapidamente
+quando eles surgirem. Faremos duas checagens relativas a dois tipos comuns de
+falhas nas gravações de soundscapes.
+
+```{r checks}
+# Primeiro, verificamos se alguma gravação deixou de ser lida. Para isso,
+# comparamos a quantidade de arquivos em disco com a quantidade de linhas que a
+# tabela de metadados trouxe:
+n_arquivos <- length(
+    list.files("soundscapes", pattern = "\\.wav$", ignore.case = TRUE)
+  )
+n_arquivos - nrow(df_soundscapes)   # 0, se todas foram lidas corretamente
+
+# Em seguida, verificamos quantas gravações das que abriram têm duração inferior
+# à esperada, que é de aproximadamente 60 segundos:
+sum(df_soundscapes$soundscape_duration <= 59) # 0 = todas com a duração esperada
+```
+
+Se o resultado dos dois últimos comandos do chunk acima foram 0, está tudo bem,
+podemos prosseguir.
+
+## Abrindo o app de segmentação
+
+As ROIs deste exemplo foram produzidas com o app de segmentação do
+`monitoraSom`. O app é interativo e será exibido em uma pop-up, caso esteja
+usando o RStudio ou navegador, ou no navegador de sua preferência, caso esteja
+usando outro editor de código ou o terminal. Executar os comandos abaixo irá
+iniciar o app para que você navegue entre as gravações segmentadas e inspecione
+diretamente as regiões de interesse (ROIs) de forma interativa.
+
+Se você apenas inspecionar as gravações, nada é gravado. Qualquer desenho ou
+edição de ROI é gravado em `rois.duckdb` ao navegar para outra gravação ou ao
+clicar em Save — a opção 'Autosave' não desativa essa gravação. Para manter
+este exemplo idêntico ao original, apenas inspecione; para restaurá-lo depois
+de edições, recupere o `rois.duckdb` da cópia original do pacote.
+
+Para segmentar as soundscapes, vamos apontar o app para a pasta onde elas estão
+já na função da lançamento. Nosso objetivo nessa segmentação foi garantir que as
+ocorrências de cantos da espécie alvo fossem corretamente demarcadas em um
+cenário realista, sem deixar nenhuma de fora, mesmo aquelas nas quais o canto
+está mascarado por ruído ou outras espécies. Além disso, existem gravações em
+que a espécie alvo estava completamente ausente.
+
+```{r seg-app soundscapes, eval = FALSE}
+launch_segmentation_app(
+    project_path = "./",
+    roi_user = "your-name",
+    soundscapes_path = "soundscapes", # pasta onde estão as soundscapes
+    roi_db = "rois.duckdb",
+    zoom_freq = c(0, 9), wl = 1024, ovlp = 50, dyn_range = c(-96, -36)
+)
+```
+
+Para as gravações focais, nosso objetivo foi outro: como o observador estava com
+o gravador e microfone apontado para a espécie alvo, o canto chega em primeiro
+plano, e a tarefa foi selecionar as melhores porções do espectro dos cantos para
+servirem de referência como templates para o matching. Das 18 ROIs demarcadas
+nas duas gravações, 6 foram marcadas com o comentário `template` e são as opções
+que o fluxo vai ler e exportar adiante. Uma ROI passa a ser tratada como
+template quando você escreve `template` no campo de comentário dela, dentro do
+app. É assim que as 6 opções deste exemplo foram marcadas.
+
+As outras 12 ROIs marcam as subestruturas desses mesmos cantos. O canto dura
+cerca de 1,5 segundo e tem três partes em sequência: duas de banda estreita,
+entre aproximadamente 3,5 e 6 kHz, e uma final, que se estende até cerca de 9
+kHz. As partes de banda estreita receberam os comentários `Substructure A` e
+`Substructure B`. A parte final, de banda de frequência  mais larga, é a marcada
+como `template`. Portanto, nesse exemplo, estamos usando apenas a parte final,
+mais marcante do canto. As ROIs de subestrutura documentam a composição interna
+do canto e não entram no fluxo, já que não foram marcadas com `template` no
+campo de comentários do app. Para incluir uma parte menor do canto nos matchings
+que serão computados mais à frente, basta escrever `template` no comentário de
+uma ROI de subestrutura e se certificar que a alteração foi exportada, assim o
+fluxo passa a exportá-la como opção de template.
+
+```{r seg-app templates, eval = FALSE}
+# Para segmentar as gravações focais e marcar novos templates:
+launch_segmentation_app(
+    project_path = ".",
+    soundscapes_path = "recordings", # pasta das gravações focais
+    roi_user = "your-name",
+    zoom_freq = c(0, 9), wl = 1024, ovlp = 50, dyn_range = c(-96, -36)
+)
+```
+
+## Exportando os templates
+
+Os seis templates deste exemplo não são distribuídos como arquivos prontos, mas
+a seguir vamos exportá-los a partir da tabela de ROIs e do áudio das gravações
+focais. Fazemos assim por dois motivos. Primeiro, a identidade do template fica
+vinculada à gravação de origem: o manifesto registra o arquivo, o instante e a
+faixa de frequência do corte, junto com o hash do áudio de origem. Isso permite
+conferir se um template corresponde ao trecho que você segmentou — um arquivo de
+áudio solto não guarda essa origem. Segundo, o corte é derivado das coordenadas
+da ROI sobre o áudio original, de forma determinística: cada execução produz
+exatamente o mesmo arquivo, e re-exportar não gera versões divergentes.
+
+```{r templates}
+# Selecionamos, na tabela de ROIs, aquelas marcadas como template:
+df_template_rois <- df_rois |>
+  filter(roi_comment == "template")
+
+# Exportamos os arquivos de áudio e registramos os metadados dos cortes:
+manifest <- export_templates(
+  df_template_rois, templates_path = "./templates/", create_dir = TRUE
+)
+
+# Em seguida, lemos os metadados dos templates recém-criados:
+df_templates <- fetch_template_metadata(
+  templates_path = file.path("templates", "templates.duckdb")
+)
+nrow(df_templates)   # devem haver 6 templates aqui
+```
+
+::: {.callout-note}
+## A pasta de cortes também é aceita
+
+A função `fetch_template_metadata()` lê tanto os metadados dos templates,
+`templates/templates.duckdb`, quanto a pasta `templates/`. Passando o nome da
+pasta o arquivo de metadados dentro dela é encontrado e lido. Uma pasta sem
+um arquivo de metadados é interpretada como templates no padrão de versões
+anteriores à 1.2.0 do monitoraSom.
+
+:::
+
+## A análise inteira, em um comando
+
+A função `template_matching()` é a principal função que organiza e simplifica o
+fluxo de obtenção das detecções, conduzindo a leitura dos metadados das
+gravações e dos templates, montando a grade de busca, roda a busca por meio de
+template matching e retorna as detecções. Com o comando abaixo, toda essa parte
+do fluxo é realizada de uma única vez.
+
+O argumento `score_method` é onde será definido o motor da busca. O `"cor"`
+calcula a correlação de Pearson entre o template e cada janela deslizante da
+soundscape, que é a implementação de referência original do `monitoraSom`. O
+`"fft"` calcula a mesma correlação por meio de transformadas de Fourier. Os dois
+dão o mesmo resultado, com diferenças na casa de 1e-6, mas o `"fft"` é cerca de
+dez vezes mais rápido, por isso foi promivido ao padrão atual.
+
+```{r canonical-run}
+df_detecs <- template_matching(
+  soundscapes_path = "soundscapes/",
+  templates_path = "templates/templates.duckdb",
+  score_method = "fft", min_score = 0.4
+)
+nrow(df_detecs)
+```
+
+Essa é a análise completa: cerca de 30 segundos para os 72 pares. Duas
+características desse comando merecem a sua atenção. A versão acima deixa os
+resultados disponíveis na seção do R, mas não salva esses resultados fora do R.
+Quando você quiser salvá-los, basta usar o argumento `output_db`.
+
+<!-- Aqui vale uma explicaçào rápida da razão pela qual esse novo formato
+substituiu o csv mais comumente usado pelos usuários. Aqui devemos convencer o
+usuário de que isso é de fato melhor. -->
+
+```{r persisting, eval = FALSE}
+template_matching(
+  soundscapes_path = "soundscapes/",
+  templates_path = "templates/templates.duckdb",
+  min_score = 0.4,
+  output_db = "detections.duckdb"
+)
+```
+
+## Os passos por dentro do orquestrador
+
+A chamada única é o caminho que nós recomendamos, mas ela apenas executa, em
+sequência, os passos que mostramos abaixo. Chame-os separadamente quando você
+precisar inspecionar ou reaproveitar um resultado intermediário.
+
+```{r expanded, eval = FALSE}
+# O mesmo fluxo do orquestrador, agora passo a passo:
+df_soundscapes <- fetch_soundscape_metadata("soundscapes/")
+df_templates   <- fetch_template_metadata("templates/templates.duckdb")
+df_grid        <- fetch_match_grid(df_soundscapes, df_templates)   # 72 pares
+df_scores      <- run_matching(df_grid, score_method = "fft")
+df_detecs      <- fetch_score_peaks(df_scores, min_score = 0.4)
+```
+
+A maior parte dos fluxos de análises que usam o `monitoraSom` darão preferência
+à função `template_matching()` quando:
+- Todas as soundscapes listadas em `df_soundscapes` serão incluídas na busca
+usando todos os templates disponíveis em `df_templates`, que resulta
+necessariamente no uso de toda a grade detalhada em `df_grid`.
+- A série completa de vetores com os scores em `df_scores`, que pode ser pesada,
+não for necessária para buscas mais detalhadas de padrões que precisem da
+totalidade dos scores, retendo somente as detecções como produto final.
+
+## O que foi criado
+
+Depois que você roda tudo o que mostramos acima, a pasta do exemplo passa a
+conter:
+
+```
+bcu/
+├── bcu.qmd                        este documento (já existia)
+├── bcu.html                       o documento renderizado
+├── rois.duckdb                    as 72 ROIs (já existia)
+├── recordings/                    as 2 gravações focais (já existia)
+├── soundscapes/                   as 12 gravações de busca (já existia)
+├── soundscapes_metadata.duckdb    ← criado ao ler os metadados
+├── templates/                     ← criado ao recortar os templates
+│   ├── templates.duckdb           o manifesto: 1 linha por template
+│   └── Bcu_1_…wav                 os 6 cortes de áudio
+└── detections.duckdb              ← criado só se você usar output_db
+```
+
+| Arquivo | Quem cria | Para que serve |
+|---|---|---|
+| `soundscapes_metadata.duckdb` | `fetch_soundscape_metadata()` | duração, taxa de amostragem, data/hora e caminho de cada gravação; relê rápido em vez de varrer o áudio de novo |
+| `templates/*.wav` | `export_templates()` | os templates recortados, que a busca usa como referência |
+| `templates/templates.duckdb` | `export_templates()` | o manifesto que descreve os cortes; `fetch_template_metadata()` o lê, diretamente ou via a pasta `templates/` |
+| `detections.duckdb` | `template_matching(output_db =)` | as detecções salvas em disco, quando você não quer só o resultado na sessão |
+
+Nenhum desses arquivos precisa ser guardado: se você apagar qualquer um deles,
+os comandos acima o recriam de forma idêntica. Os únicos arquivos insubstituíveis
+são os arquivos de audio e `rois.duckdb`, que contém a segmentação manual
+necessária para extração dos templates.
+produzimos para este exemplo.
+
+## Próximo passo
+
+As detecções são candidatas, não resultados: o matching mede semelhança, e
+semelhança não é identificação. Para saber quais são reais você precisa de ROIs
+de referência cobrindo as mesmas gravações que foram percorridas, e então
+`validate_by_overlap()` julga cada detecção e `diagnostic_validations()` ajusta
+um limiar a partir desse julgamento.
