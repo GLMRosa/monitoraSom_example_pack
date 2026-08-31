@@ -44,3 +44,5 @@ detections/
 
 AGENTS.md
 STATUS.md
+# generated release bundles (regenerable via ep_tar; not repo members)
+outputs/
